@@ -12,12 +12,16 @@
 #include "llvm/ADT/SmallPtrSet.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdlib>
-#include <iostream>
+#include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace idt {
@@ -63,9 +67,21 @@ ignored_symbols("ignore",
                 llvm::cl::CommaSeparated,
                 llvm::cl::cat(idt::category));
 
+llvm::cl::opt<std::string>
+main_file("main-file",
+          llvm::cl::desc("Path of a translation unit with an entry in the "
+                         "compilation database whose flags will be used to "
+                         "parse the positional argument"),
+          llvm::cl::value_desc("path"), llvm::cl::cat(idt::category));
+
 template <typename Key, typename Compare, typename Allocator>
 bool contains(const std::set<Key, Compare, Allocator>& set, const Key& key) {
   return set.find(key) != set.end();
+}
+
+template <class T, std::size_t N>
+bool contains(const std::array<T, N>& arr, const T& value) {
+  return std::find(arr.begin(), arr.end(), value) != arr.end();
 }
 
 const std::set<std::string> &get_ignored_symbols() {
@@ -271,6 +287,16 @@ class visitor : public clang::RecursiveASTVisitor<visitor> {
     return false;
   }
 
+  // When `--main-file` is set, the positional argument is parsed as the
+  // translation unit's main file; restrict fixits to it so we don't
+  // accidentally rewrite decls in transitively-included headers. Outside
+  // of `--main-file` mode, this is a no-op.
+  template <typename Decl_> bool is_in_main_tu(const Decl_ *D) const {
+    if (main_file.empty())
+      return true;
+    return source_manager_.isInMainFile(get_location(D));
+  }
+
   template <typename Decl_>
   inline bool is_in_system_header(const Decl_ *D) const {
     return source_manager_.isInSystemHeader(get_location(D));
@@ -345,6 +371,10 @@ class visitor : public clang::RecursiveASTVisitor<visitor> {
 
     // Skip declarations not in header files.
     if (!is_in_header(FD))
+      return;
+
+    // Restrict to the main TU when `--main-file` is set.
+    if (!is_in_main_tu(FD))
       return;
 
     // Ignore friend declarations.
@@ -431,6 +461,10 @@ class visitor : public clang::RecursiveASTVisitor<visitor> {
     if (!is_in_header(VD))
       return;
 
+    // Restrict to the main TU when `--main-file` is set.
+    if (!is_in_main_tu(VD))
+      return;
+
     // Skip local variables. We are only interested in static fields.
     if (VD->getParentFunctionOrMethod())
       return;
@@ -499,6 +533,10 @@ class visitor : public clang::RecursiveASTVisitor<visitor> {
 
     // Ignore declarations from the system.
     if (is_in_system_header(RD))
+      return;
+
+    // Restrict to the main TU when `--main-file` is set.
+    if (!is_in_main_tu(RD))
       return;
 
     // Skip exporting template classes. For fully-specialized template classes,
@@ -737,6 +775,59 @@ struct factory : clang::tooling::FrontendActionFactory {
     return std::make_unique<idt::action>();
   }
 };
+
+// CompilationDatabase wrapper that looks up flags under one path (the
+// "donor") and reports them as belonging to a different path (the actual
+// input). Used by `--main-file` for projects where headers do not appear in
+// the compilation database.
+class main_file_database : public clang::tooling::CompilationDatabase {
+public:
+  main_file_database(const clang::tooling::CompilationDatabase &inner,
+                     std::string donor)
+      : inner_(inner), donor_(std::move(donor)) {}
+
+  std::vector<clang::tooling::CompileCommand>
+  getCompileCommands(llvm::StringRef path) const override {
+    auto commands = inner_.getCompileCommands(donor_);
+    for (auto &command : commands)
+      rewrite(command, path);
+    return commands;
+  }
+
+  // Stub these out for safety since we do not use them.
+  std::vector<std::string> getAllFiles() const override { return {}; }
+
+  std::vector<clang::tooling::CompileCommand>
+  getAllCompileCommands() const override {
+    return {};
+  }
+
+private:
+  static void rewrite(clang::tooling::CompileCommand &command,
+                      llvm::StringRef path) {
+    static constexpr std::array<llvm::StringRef, 5> kSourceExts{
+        ".cpp", ".cc", ".cxx", ".c++", ".C",
+    };
+
+    // Replace the first source-file argument with `path`. If none is
+    // present, append `path` as the input.
+    bool swapped = false;
+    for (auto &arg : command.CommandLine) {
+      if (contains(kSourceExts, llvm::sys::path::extension(llvm::StringRef(arg)))) {
+        arg = path.str();
+        swapped = true;
+        break;
+      }
+    }
+    if (!swapped)
+      command.CommandLine.push_back(path.str());
+
+    command.Filename = path.str();
+  }
+
+  const clang::tooling::CompilationDatabase &inner_;
+  std::string donor_;
+};
 }
 
 int main(int argc, char *argv[]) {
@@ -746,7 +837,13 @@ int main(int argc, char *argv[]) {
       CommonOptionsParser::create(argc, const_cast<const char **>(argv),
                                   idt::category, llvm::cl::OneOrMore);
   if (options) {
-    ClangTool tool{options->getCompilations(), options->getSourcePathList()};
+    std::unique_ptr<CompilationDatabase> wrapped;
+    CompilationDatabase *cdb = &options->getCompilations();
+    if (!main_file.empty()) {
+      wrapped = std::make_unique<idt::main_file_database>(*cdb, main_file);
+      cdb = wrapped.get();
+    }
+    ClangTool tool{*cdb, options->getSourcePathList()};
     return tool.run(new idt::factory{});
   } else {
     llvm::logAllUnhandledErrors(std::move(options.takeError()), llvm::errs());
