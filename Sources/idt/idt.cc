@@ -4,11 +4,13 @@
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "clang/Lex/Lexer.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Rewrite/Frontend/FixItRewriter.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 #include "clang/Tooling/Tooling.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 #include <algorithm>
@@ -43,6 +45,13 @@ export_macro("export-macro",
              llvm::cl::desc("The macro to decorate interfaces with"),
              llvm::cl::value_desc("define"), llvm::cl::Required,
              llvm::cl::cat(idt::category));
+
+llvm::cl::opt<std::string> not_exported_macro(
+    "not-exported-macro",
+    llvm::cl::desc("Marker macro that opts it out of export "
+                   "annotation. If unset, no opt-out marker is "
+                   "recognized."),
+    llvm::cl::value_desc("define"), llvm::cl::cat(idt::category));
 
 llvm::cl::opt<std::string>
 include_header("include-header",
@@ -95,6 +104,9 @@ const std::set<std::string> &get_ignored_symbols() {
 }
 
 namespace idt {
+// Spelling locations where the not exported macro was expanded.
+using MarkerLocations = llvm::DenseSet<clang::SourceLocation>;
+
 struct PPCallbacks : clang::PPCallbacks {
   // Describes the source location of an #include statement and the name of the
   // file being included.
@@ -105,8 +117,24 @@ struct PPCallbacks : clang::PPCallbacks {
   using FileIncludes =
       std::unordered_map<std::string, std::vector<IncludeLocation>>;
 
-  PPCallbacks(clang::SourceManager &source_manager, FileIncludes &file_includes)
-      : source_manager_(source_manager), file_includes_(file_includes) {}
+  PPCallbacks(clang::SourceManager &source_manager, FileIncludes &file_includes,
+              MarkerLocations &marker_locations, std::string not_exported_macro)
+      : source_manager_(source_manager), file_includes_(file_includes),
+        marker_locations_(marker_locations),
+        not_exported_macro_(std::move(not_exported_macro)) {}
+
+  // Record the location of every expansion of the not exported macro marker.
+  // Firing on expansions (not the `#define`) is what lets the visitor
+  // distinguish a genuine use decorating a declaration from the macro's
+  // definition or an unrelated textual occurrence.
+  void MacroExpands(const clang::Token &MacroNameTok,
+                    const clang::MacroDefinition &, clang::SourceRange Range,
+                    const clang::MacroArgs *) override {
+    const clang::IdentifierInfo *II = MacroNameTok.getIdentifierInfo();
+    if (II && II->getName() == not_exported_macro_)
+      marker_locations_.insert(
+          source_manager_.getSpellingLoc(Range.getBegin()));
+  }
 
   void
   InclusionDirective(clang::SourceLocation HashLoc,
@@ -140,6 +168,8 @@ struct PPCallbacks : clang::PPCallbacks {
 private:
   clang::SourceManager &source_manager_;
   FileIncludes &file_includes_;
+  MarkerLocations &marker_locations_;
+  std::string not_exported_macro_;
 };
 
 // Track a set of clang::Decl declarations by unique ID.
@@ -171,6 +201,7 @@ class visitor : public clang::RecursiveASTVisitor<visitor> {
   std::optional<unsigned> id_improper_;
   std::optional<unsigned> id_exported_;
   PPCallbacks::FileIncludes &file_includes_;
+  const MarkerLocations &marker_locations_;
 
   // Accumulates the set of declarations that have been marked for export by
   // this visitor.
@@ -332,6 +363,36 @@ class visitor : public clang::RecursiveASTVisitor<visitor> {
     return false;
   }
 
+  // Detect a not exported macro written immediately before the declaration
+  // anchored at `Anchor`. The marker expands to nothing, so it leaves no trace
+  // in the AST. We recover it by combining two facts: the raw token immediately
+  // preceding `Anchor` (adjacency), and the set of source locations where the
+  // marker macro was actually *expanded*, collected by the preprocessor
+  // callback (validity).
+  // Requiring both means a bare `#define NOT_EXPORTED_MACRO`, or the marker
+  // decorating some other earlier declaration, is never mistaken for a marker
+  // on this one. A declaration carrying the marker has been deliberately opted
+  // out of exporting, so idt must not add the export macro to it.
+  bool is_marked_not_exported(clang::SourceLocation Anchor) const {
+    // Return early if no locations were recorded.
+    if (marker_locations_.empty())
+      return false;
+
+    if (Anchor.isInvalid())
+      return false;
+    if (Anchor.isMacroID())
+      Anchor = source_manager_.getExpansionLoc(Anchor);
+
+    std::optional<clang::Token> tok = clang::Lexer::findPreviousToken(
+        Anchor, source_manager_, context_.getLangOpts(),
+        /*IncludeComments=*/false);
+    if (!tok)
+      return false;
+
+    return marker_locations_.contains(
+        source_manager_.getSpellingLoc(tok->getLocation()));
+  }
+
   // Emit a FixIt if a symbol is annotated with a default visibility or DLL
   // export/import annotation. The FixIt will remove the annotation
   template <typename Decl_>
@@ -446,6 +507,10 @@ class visitor : public clang::RecursiveASTVisitor<visitor> {
     if (!FD->attrs().empty())
       SLoc = FD->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
 
+    // Respect an explicit opt-out marker.
+    if (is_marked_not_exported(FD->getBeginLoc()))
+      return;
+
     unexported_public_interface(FD, SLoc)
         << FD << clang::FixItHint::CreateInsertion(SLoc, export_macro + " ");
   }
@@ -520,8 +585,20 @@ class visitor : public clang::RecursiveASTVisitor<visitor> {
     if (!VD->attrs().empty() || VD->hasExternalStorage())
       SLoc = VD->getTypeSourceInfo()->getTypeLoc().getBeginLoc();
 
+    // Respect an explicit opt-out marker.
+    if (is_marked_not_exported(VD->getBeginLoc()))
+      return;
+
     unexported_public_interface(VD, SLoc)
         << VD << clang::FixItHint::CreateInsertion(SLoc, export_macro + " ");
+  }
+
+  // The location idt annotates a record at: immediately before the tag name,
+  // or before the qualifier for an out-of-line/qualified definition.
+  clang::SourceLocation
+  record_annotation_loc(const clang::CXXRecordDecl *RD) const {
+    return RD->getQualifier() ? RD->getQualifierLoc().getBeginLoc()
+                              : RD->getLocation();
   }
 
   // Determine if a tagged type needs exporting at the record level and add the
@@ -560,22 +637,28 @@ class visitor : public clang::RecursiveASTVisitor<visitor> {
 
     // Insert the annotation immediately before the tag name, which is the
     // position returned by getLocation.
-    clang::LangOptions LO = RD->getASTContext().getLangOpts();
-    clang::SourceLocation SLoc = RD->getQualifier()
-                                     ? RD->getQualifierLoc().getBeginLoc()
-                                     : RD->getLocation();
+    clang::SourceLocation SLoc = record_annotation_loc(RD);
     const clang::SourceLocation location =
         context_.getFullLoc(SLoc).getExpansionLoc();
+
     unexported_public_interface(RD, location)
         << RD << clang::FixItHint::CreateInsertion(SLoc, export_macro + " ");
   }
 
 public:
-  visitor(clang::ASTContext &context, PPCallbacks::FileIncludes &file_includes)
+  visitor(clang::ASTContext &context, PPCallbacks::FileIncludes &file_includes,
+          const MarkerLocations &marker_locations)
       : context_(context), source_manager_(context.getSourceManager()),
-        file_includes_(file_includes) {}
+        file_includes_(file_includes), marker_locations_(marker_locations) {}
 
   bool TraverseCXXRecordDecl(clang::CXXRecordDecl *RD) {
+    // A class carrying the opt-out marker is pruned entirely: neither the class
+    // nor any of its members are annotated, and nested declarations are not
+    // visited. Static data members are likewise left untouched -- the author
+    // annotates them explicitly if they should be exported.
+    if (is_marked_not_exported(record_annotation_loc(RD)))
+      return true;
+
     export_record_if_needed(RD);
 
     // Traverse the class by invoking the parent's version of this method. This
@@ -722,8 +805,9 @@ class consumer : public clang::ASTConsumer {
   std::unique_ptr<clang::FixItRewriter> rewriter_;
 
 public:
-  consumer(clang::ASTContext &context, PPCallbacks::FileIncludes &file_includes)
-      : visitor_(context, file_includes) {}
+  consumer(clang::ASTContext &context, PPCallbacks::FileIncludes &file_includes,
+           const MarkerLocations &marker_locations)
+      : visitor_(context, file_includes, marker_locations) {}
 
   void HandleTranslationUnit(clang::ASTContext &context) override {
     if (apply_fixits) {
@@ -745,29 +829,32 @@ public:
 
 struct action : clang::ASTFrontendAction {
   void ExecuteAction() override {
-    if (!include_header.empty())
+    if (!include_header.empty() || !not_exported_macro.empty())
       installPPCallbacks();
     clang::ASTFrontendAction::ExecuteAction();
   }
 
   std::unique_ptr<clang::ASTConsumer>
   CreateASTConsumer(clang::CompilerInstance &CI, llvm::StringRef) override {
-    return std::make_unique<idt::consumer>(CI.getASTContext(), file_includes_);
+    return std::make_unique<idt::consumer>(CI.getASTContext(), file_includes_,
+                                           marker_locations_);
   }
 
 private:
   // Install a callback that will be invoked on every preprocessor include
   // statement. This is done so we can determine if a user-specified custom
   // include statment needs to be added if any annotations are added.
+  // This also records the locations of the not exported macro.
   void installPPCallbacks() {
     clang::CompilerInstance &compiler_instance = getCompilerInstance();
     clang::Preprocessor &preprocessor = compiler_instance.getPreprocessor();
     clang::SourceManager &source_manager = compiler_instance.getSourceManager();
-    preprocessor.addPPCallbacks(
-        std::make_unique<PPCallbacks>(source_manager, file_includes_));
+    preprocessor.addPPCallbacks(std::make_unique<PPCallbacks>(
+        source_manager, file_includes_, marker_locations_, not_exported_macro));
   }
 
   PPCallbacks::FileIncludes file_includes_;
+  MarkerLocations marker_locations_;
 };
 
 struct factory : clang::tooling::FrontendActionFactory {
